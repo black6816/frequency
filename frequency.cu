@@ -42,7 +42,7 @@ deviceQuery, CUDA Driver = CUDART, CUDA Driver Version = 5.0, CUDA Runtime Versi
 //#include "helper_functions.h"
 //#include "helper_cuda.h"
 #include <stdio.h>
-
+#include "makeDat.h"
 
 __global__ void freqencyStep1(char *d_dat,int len, int *d_freq)
 {//步骤一，先将数据加和到share memory中，然后再累加到显存上。
@@ -59,6 +59,17 @@ __global__ void freqencyStep1(char *d_dat,int len, int *d_freq)
         //if((d_dat[i]>='a')&&(d_dat[i]<='z'))//如果确定数据只是a--z，可以把if去掉。
             myfreq[d_dat[i]-'a']++;
     __syncthreads();///各线程统计到自己的sharememory中。
+	///用一个循环实现折半加。
+	for(int roll = 64;roll>=1; roll>>=1)
+	{
+		if(threadIdx.x <roll)
+		{
+			for(int i=0;i<26;i++)
+				myfreq[i] += sfreq[27*(threadIdx.x+roll)+i];
+		}
+		__syncthreads();
+	}
+#if 0
     if(threadIdx.x<64)
     {
         for(int i=0;i<26;i++)
@@ -96,42 +107,35 @@ __global__ void freqencyStep1(char *d_dat,int len, int *d_freq)
         for(int i=0;i<26;i++)
             myfreq[i] += sfreq[27*(threadIdx.x   )+i];
     }
-    __syncthreads();
+#endif
+	__syncthreads();
 
-//    myfreq = &d_freq[blockIdx.x * 26 + blockIdx.x];///第一步的结果先保存到显存中。每个block用0到25号线程保存数据
-//    if(threadIdx.x<26)
-//        myfreq[i] = sfreq[i];
     if(threadIdx.x<26)///如果显卡支持原子加，可以使用原子加，直接加到显存上。那样就没有第二步。 1.1及以上支持全局显存的32位原子操作。
 	    atomicAdd(&d_freq[threadIdx.x],sfreq[threadIdx.x]);
 
 }
-#if 0
-__global__ void frequencyStep2(int *d_freq,int *d_swap,int blocksInStep1)//考虑第一步使用的block的个数，如果较少，那么直接用26个线程加完即可。
-{////硬件不支持原子加时，第一步要先写到显存，然后第二步进行累加。第二步每个block只使用208个线程，8组26线程。
-    __shared__ int sfreq[256];
+__global__ void freqencyMethod2(char *d_dat,int len, int *d_freq)
+{//方法二，先将数据原子加到share memory中，然后再累加到显存上。
 
-    for(int i=threadIdx.x;i<256;i+=blockDim.x) sfreq[i ] = 0;
+    __shared__ int sfreq[26];//
+
+    if(threadIdx.x < 26)
+        sfreq[threadIdx.x] = 0;////先清空。
     __syncthreads();
-	int allNumber = blocksInStep1*26;
-	int gridSize = blockDim.x*gridDim.x;
-    for(int i=threadIdx.x;i<allNumber;i+=gridSize)
-	    sfreq[threadIdx.x ] += d_freq[i];
-	__syncthreads();
-	if(threadIdx.x<104)
-	    sfreq[threadIdx.x]+= sfreq[threadIdx.x+104];
-	__syncthreads();
-	if(threadIdx.x<52)
-	    sfreq[threadIdx.x]+= sfreq[threadIdx.x+52];
-	__syncthreads();
-	if(threadIdx.x<26)
+    int gridsize = blockDim.x * gridDim.x;
+	int pos = 0;
+    for(int i=threadIdx.x + blockIdx.x*blockDim.x; i< len; i += gridsize)
 	{
-	    sfreq[threadIdx.x]+= sfreq[threadIdx.x+26];
-		////再写到显存中。
-		d_swap[threadIdx.x+blockIdx.x*26] = sfreq[threadIdx.x];
+		pos = d_dat[i]-'a';
+		atomicAdd(&sfreq[pos],1);
 	}
+	__syncthreads();
+
+    if(threadIdx.x<26)///如果显卡支持原子加，可以使用原子加，直接加到显存上。那样就没有第二步。 1.1及以上支持全局显存的32位原子操作。
+	    atomicAdd(&d_freq[threadIdx.x],sfreq[threadIdx.x]);
+
 }
-////step2需要做好几次，直到最后8组26个频次以内。
-#endif
+
 void hostCalc(char *dat,int len,int *freqency)
 {
     int freque[32];
@@ -144,28 +148,11 @@ void hostCalc(char *dat,int len,int *freqency)
 	memcpy(freqency,freque,26*sizeof(int));
 }
 
-void makeData(char *filename,int len)
-{
-	if(len<0) {
-		fprintf(stdout,"len = %d\n",len);
-		return;
-	}
-	FILE *fp = fopen(filename,"w");
-	int len1  = (len-(len&1023)+1024;
-	char *dat = new char [len1];
-	memset(dat,0,len1);
-	srand(0);
-	for(int i=0;i<len;i++)
-	{
-		int x = rand();
-		x%=26;
-		dat[i] = 'a'+x;
-	}
-	fwrite(dat,1,len,fp);
-	fclose(fp);
-}
+
 int main(int argc,char **argv)
 {
+	//makeData("char26.dat",104857600);
+	//return 0;
 	if(argc<2)
 	{
 		fprintf(stdout,"usage: a.out datfile\n");
@@ -196,6 +183,13 @@ int main(int argc,char **argv)
 	int *d_freq;
 	int gpuFreq[32];
 	int cpuFreq[32];
+	cudaEvent_t start, stop;
+	clock_t t0,t1,t2;
+	float cptime,runtime;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord( start, 0 );//记录时间点
+	t0 = clock();
 	
 	cudaStatus = cudaMalloc((void **)&d_dat,len*sizeof(char));
 	if(cudaStatus != cudaSuccess) {
@@ -212,8 +206,13 @@ int main(int argc,char **argv)
     }
 	cudaMemcpy(d_dat,dat,len*sizeof(char),cudaMemcpyHostToDevice);
 	cudaMemset(d_freq,0,32*sizeof(int));
+	cudaEventRecord( stop, 0 );////记录时间点
+	cudaEventSynchronize( stop );
+	cudaEventElapsedTime( &cptime, start, stop );
+	t1 = clock();
 	
 	freqencyStep1<<<256,128>>>(d_dat,len,d_freq);
+//	freqencyMethod2<<<256,128>>>(d_dat,len,d_freq);
 	cudaStatus = cudaThreadSynchronize();
 	if(cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!\n");
@@ -222,9 +221,23 @@ int main(int argc,char **argv)
 		free(dat);
         return -1;
     }
+	cudaEventRecord( start, 0 );////记录时间点
+	cudaEventSynchronize( start );
+	cudaEventElapsedTime( &runtime, stop,start );///掉个个来用。
+	t2 = clock();
+
 	cudaMemcpy(gpuFreq,d_freq,32*sizeof(int),cudaMemcpyDeviceToHost);
 
+	clock_t ht0 = clock();
+	cudaEventRecord( start, 0 );////记录时间点
+	cudaEventSynchronize( start );
 	hostCalc(dat, len,cpuFreq);
+	cudaEventRecord( stop, 0 );////记录时间点
+	cudaEventSynchronize( stop );
+	clock_t ht1 = clock();
+	float hruntime =0.0f;
+	cudaEventElapsedTime( &hruntime, start,stop );///主机计算的时间。
+
 	cudaFree(d_freq);
 	cudaFree(d_dat);
 	///check
@@ -234,6 +247,13 @@ int main(int argc,char **argv)
 		fprintf(stdout,"CHECK OK\n");
 
 	free(dat);
+
+	cudaEventDestroy( start );
+	cudaEventDestroy( stop );
+	printf("cptime %9.4f ms  runtime %9.4f ms\n",cptime,runtime); 
+	printf("t1-t0=%d   t2-t1 = %d \n",t1-t0,t2-t1);
+	printf("host run time = %9.4f ms %d \n",hruntime,ht1-ht0);
+
 
     return 0;
 }
